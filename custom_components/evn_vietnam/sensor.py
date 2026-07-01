@@ -34,6 +34,7 @@ from .const import (
     CONF_USERNAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    ID_LOADSHEDDING,
 )
 from .types import EVN_SENSORS, EVNSensorEntityDescription
 
@@ -52,10 +53,15 @@ async def async_setup_entry(
 
     await evn_device.async_create_coordinator(hass, entry)
 
-    entities = []
-    entities.extend(
-        [EVNSensor(evn_device, description, hass) for description in EVN_SENSORS]
-    )
+    # Chỉ khu vực có API lịch cắt điện (hiện tại: EVNSPC) mới tạo sensor này
+    evn_area = entry_config.get(CONF_AREA) or {}
+    supports_loadshedding = bool(evn_area.get("evn_loadshedding_url"))
+
+    entities = [
+        EVNSensor(evn_device, description, hass)
+        for description in EVN_SENSORS
+        if description.key != ID_LOADSHEDDING or supports_loadshedding
+    ]
 
     async_add_entities(entities)
 
