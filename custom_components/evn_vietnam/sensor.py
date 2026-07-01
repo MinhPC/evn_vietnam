@@ -11,6 +11,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
@@ -57,13 +58,26 @@ async def async_setup_entry(
     evn_area = entry_config.get(CONF_AREA) or {}
     supports_loadshedding = bool(evn_area.get("evn_loadshedding_url"))
 
-    entities = [
-        EVNSensor(evn_device, description, hass)
+    descriptions = [
+        description
         for description in EVN_SENSORS
         if description.key != ID_LOADSHEDDING or supports_loadshedding
     ]
 
-    async_add_entities(entities)
+    # Dọn entity cũ không còn được tạo (vd loadshedding ở khu vực không hỗ trợ)
+    # để tránh entity mồ côi hiển thị "Unavailable".
+    created_unique_ids = {
+        f"{evn_device._customer_id}_{description.key}".lower()
+        for description in descriptions
+    }
+    registry = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if reg_entry.unique_id not in created_unique_ids:
+            registry.async_remove(reg_entry.entity_id)
+
+    async_add_entities(
+        EVNSensor(evn_device, description, hass) for description in descriptions
+    )
 
 
 class EVNDevice:

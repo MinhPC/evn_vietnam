@@ -9,7 +9,7 @@ DOMAIN = "evn_vietnam"
 CONF_DEVICE_NAME = "EVN Monitor"
 CONF_DEVICE_MODEL = "Vietnam EVN Monitor"
 CONF_DEVICE_MANUFACTURER = "Minh Phan"
-CONF_DEVICE_SW_VERSION = "1.0.0"
+CONF_DEVICE_SW_VERSION = "1.0.1"
 
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
