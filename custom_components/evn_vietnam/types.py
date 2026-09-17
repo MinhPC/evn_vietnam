@@ -1,4 +1,3 @@
-from array import ArrayType
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -52,7 +51,7 @@ class Area:
     evn_loadshedding_url: str | None = None
     supported: bool = True
     date_needed: bool = True
-    pattern: ArrayType | None = None
+    pattern: list[str] | None = None
 
 
 @dataclass

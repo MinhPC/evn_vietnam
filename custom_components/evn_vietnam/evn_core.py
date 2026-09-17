@@ -133,7 +133,11 @@ class EVNAPI:
                 username, password, customer_id, from_date, to_date
             )
 
-        if fetch_data["status"] == CONF_SUCCESS:
+        if not fetch_data:
+            _LOGGER.error("Unsupported EVN area: %s", evn_area.get("name"))
+            return {"status": CONF_ERR_UNKNOWN, "data": "Unsupported EVN area"}
+
+        if fetch_data.get("status") == CONF_SUCCESS:
             return formatted_result(fetch_data)
 
         return fetch_data
@@ -204,22 +208,24 @@ class EVNAPI:
         login_state = resp_json["state"]
 
         if login_state in (CONF_SUCCESS, "login"):
-            cookies = resp.headers.get("Set-Cookie", "")
-            evn_session = None
-            expires = None
-            for cookie in cookies.split(";"):
-                if "evn_session=" in cookie:
-                    evn_session = cookie.split("evn_session=")[-1].strip()
-                if "expires=" in cookie:
-                    expires = cookie.split("expires=")[-1].strip()
-                    expires = parser.parse(expires)
+            cookie_morsel = resp.cookies.get("evn_session")
 
-            if evn_session:
-                self._evn_area["evn_session"] = evn_session
-                if expires:
-                    self._evn_area["expires"] = expires.replace(tzinfo=timezone.utc)
-                    _LOGGER.info("Login successful. Session: %s", evn_session)
-                    return CONF_SUCCESS
+            if cookie_morsel and cookie_morsel.value:
+                self._evn_area["evn_session"] = cookie_morsel.value
+
+                expires_str = cookie_morsel.get("expires")
+                if expires_str:
+                    try:
+                        self._evn_area["expires"] = parser.parse(
+                            expires_str
+                        ).replace(tzinfo=timezone.utc)
+                    except (ValueError, OverflowError):
+                        self._evn_area.pop("expires", None)
+                else:
+                    self._evn_area.pop("expires", None)
+
+                _LOGGER.info("Login successful. Session: %s", cookie_morsel.value)
+                return CONF_SUCCESS
 
         _LOGGER.error(f"Unable to login into EVN Endpoint: {resp_json}")
         return CONF_ERR_INVALID_AUTH
@@ -789,7 +795,7 @@ class EVNAPI:
         try:
             to_date = datetime.strptime(
                 current_einfo.get("thoiDiem"), "%Hh%M - %d/%m/%Y"
-            )
+            ).date()
         except Exception:
             to_date = datetime.now().date()
 
@@ -848,8 +854,11 @@ class EVNAPI:
             api_name="Fetch EVN data"
         )
 
-        if not resp_json:
-            raise ValueError("Received empty response from EVN data API.")
+        if status != CONF_SUCCESS or not resp_json:
+            return {
+                "status": status if status != CONF_SUCCESS else CONF_ERR_UNKNOWN,
+                "data": resp_json,
+            }
 
         from_date = parser.parse(resp_json[0]["strTime"], dayfirst=True) + timedelta(days=1)
         to_date = parser.parse(
@@ -992,6 +1001,8 @@ def formatted_result(raw_data: dict) -> dict:
             "value": calc_ecost(raw_data[ID_ECON_MONTHLY_NEW]),
         }
 
+    monthly_total = raw_data.get(ID_ECON_MONTHLY_NEW)
+
     if raw_data[ID_ECON_DAILY_NEW] is not None:
         if raw_data["to_date"] == time_obj.date():
             info = "hôm nay"
@@ -1000,9 +1011,15 @@ def formatted_result(raw_data: dict) -> dict:
         else:
             info = f'ngày {raw_data["to_date"].strftime("%d/%m")}'
 
+        if monthly_total is not None:
+            cumulative_before_new = max(0.0, monthly_total - raw_data[ID_ECON_DAILY_NEW])
+            ecost_daily_new = calc_ecost_delta(cumulative_before_new, monthly_total)
+        else:
+            ecost_daily_new = calc_ecost(raw_data[ID_ECON_DAILY_NEW])
+
         res[ID_ECON_DAILY_NEW] = {"value": raw_data[ID_ECON_DAILY_NEW], "info": info}
         res[ID_ECOST_DAILY_NEW] = {
-            "value": calc_ecost(raw_data[ID_ECON_DAILY_NEW]),
+            "value": ecost_daily_new,
             "info": info,
         }
 
@@ -1014,9 +1031,20 @@ def formatted_result(raw_data: dict) -> dict:
         else:
             info = f'ngày {raw_data["previous_date"].strftime("%d/%m")}'
 
+        if monthly_total is not None and raw_data[ID_ECON_DAILY_NEW] is not None:
+            cumulative_through_old = max(
+                0.0, monthly_total - raw_data[ID_ECON_DAILY_NEW]
+            )
+            cumulative_before_old = max(
+                0.0, cumulative_through_old - raw_data[ID_ECON_DAILY_OLD]
+            )
+            ecost_daily_old = calc_ecost_delta(cumulative_before_old, cumulative_through_old)
+        else:
+            ecost_daily_old = calc_ecost(raw_data[ID_ECON_DAILY_OLD])
+
         res[ID_ECON_DAILY_OLD] = {"value": raw_data[ID_ECON_DAILY_OLD], "info": info}
         res[ID_ECOST_DAILY_OLD] = {
-            "value": calc_ecost(raw_data[ID_ECON_DAILY_OLD]),
+            "value": ecost_daily_old,
             "info": info,
         }
 
@@ -1148,6 +1176,15 @@ def calc_ecost(kwh: float) -> str:
 
     return str(total_price)
 
+def calc_ecost_delta(prior_kwh: float, new_total_kwh: float) -> str:
+    """Calculate the marginal cost of consumption added on top of prior_kwh,
+    based on the progressive monthly tier the new total falls into."""
+
+    prior_cost = int(calc_ecost(prior_kwh))
+    total_cost = int(calc_ecost(new_total_kwh))
+
+    return str(max(0, total_cost - prior_cost))
+
 def safe_float(value, default=0.0):
     try:
         return float(str(value).replace(",", "")) if value is not None else default
@@ -1189,23 +1226,29 @@ async def fetch_with_retries(
     url, headers, params, max_retries=3, session=None, allow_empty=False, api_name="API"
 ):
     """Fetch data with retry mechanism."""
+    status = CONF_ERR_CANNOT_CONNECT
+    resp_json = None
+
     for attempt in range(max_retries):
         try:
             resp = await session.get(url=url, headers=headers, params=params, ssl=False)
             status, resp_json = await json_processing(resp)
-            
+
             if status == CONF_EMPTY:
                 return CONF_EMPTY, []
 
             if status == CONF_SUCCESS or (allow_empty and status == CONF_EMPTY):
                 return status, resp_json
-            
+
             _LOGGER.error(f"Attempt {attempt + 1}/{max_retries} failed for {api_name}: {resp_json}")
-        
+
         except Exception as e:
+            status = CONF_ERR_UNKNOWN
+            resp_json = str(e)
             _LOGGER.error(f"Attempt {attempt + 1}/{max_retries} encountered an error: {str(e)}")
 
-    raise Exception(f"Failed to fetch data of {api_name} after {max_retries} attempts.")
+    _LOGGER.error(f"Failed to fetch data of {api_name} after {max_retries} attempts.")
+    return status, resp_json
 
 def get_evn_info_sync(customer_id: str, branches_data=None):
     """Synchronous helper to get EVN info"""
