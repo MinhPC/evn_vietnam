@@ -1,5 +1,6 @@
 """Setup and manage the EVN API."""
 
+import asyncio
 import base64
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -40,11 +41,11 @@ from .const import (
     ID_LATEST_UPDATE,
     ID_M_PAYMENT_NEEDED,
     ID_PAYMENT_NEEDED,
-    ID_LOADSHEDDING,    
+    ID_LOADSHEDDING,
     ID_TO_DATE,
     STATUS_N_PAYMENT_NEEDED,
     STATUS_PAYMENT_NEEDED,
-    STATUS_LOADSHEDDING,    
+    STATUS_LOADSHEDDING,
     VIETNAM_ECOST_STAGES,
     VIETNAM_ECOST_VAT,
 )
@@ -52,16 +53,70 @@ from .types import EVN_NAME, VIETNAM_EVN_AREA, Area
 
 _LOGGER = logging.getLogger(__name__)
 
+EVN_BRANCHES_FILE = os.path.join(os.path.dirname(__file__), "evn_branches.json")
+
+UA_BROWSER = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36"
+)
+UA_NPC = "NPCApp/1 CFNetwork/1240.0.4 Darwin/20.6.0"
+UA_SPC = "evnapp/59 CFNetwork/1240.0.4 Darwin/20.6.0"
+
+# Tạo SSL context là thao tác blocking & tốn kém -> chỉ tạo một lần rồi cache.
+_SSL_CONTEXTS: dict[str, ssl.SSLContext] = {}
+
+# Cache nội dung evn_branches.json (dùng chung cho config flow & sensor).
+_BRANCHES_CACHE: dict[str, str] | None = None
+
+
 def create_ssl_context():
     """Create SSL context with cipher settings"""
     context = ssl.create_default_context()
     context.set_ciphers("ALL:@SECLEVEL=1")
     return context
 
-def read_evn_branches_file(file_path):
+
+async def async_get_ssl_context(hass: HomeAssistant, legacy: bool = False):
+    """Return a cached SSL context (legacy=True: cho phép cipher cũ)."""
+    key = "legacy" if legacy else "default"
+    if key not in _SSL_CONTEXTS:
+        _SSL_CONTEXTS[key] = await hass.async_add_executor_job(
+            create_ssl_context if legacy else ssl.create_default_context
+        )
+    return _SSL_CONTEXTS[key]
+
+
+def read_evn_branches_file(file_path=EVN_BRANCHES_FILE):
     """Read EVN branches file synchronously"""
-    with open(file_path) as f:
+    with open(file_path, encoding="utf-8") as f:
         return json.load(f)
+
+
+async def async_load_evn_branches(hass: HomeAssistant) -> dict[str, str] | None:
+    """Load evn_branches.json một lần duy nhất (không block event loop)."""
+    global _BRANCHES_CACHE
+    if _BRANCHES_CACHE is None:
+        try:
+            _BRANCHES_CACHE = await hass.async_add_executor_job(read_evn_branches_file)
+        except Exception as ex:
+            _LOGGER.error("Error loading EVN branch info: %s", ex)
+            return None
+    return _BRANCHES_CACHE
+
+
+def _pick(items: list, back: int):
+    """Phần tử thứ `back` tính từ cuối; nếu list ngắn hơn thì lấy phần tử đầu."""
+    return items[-back] if len(items) >= back else items[0]
+
+
+def _num(value) -> float:
+    """Chuyển số dạng '1,234.5' thành float."""
+    return float(str(value).replace(",", ""))
+
+
+def _vn_num(value: str) -> float:
+    """Chuyển số kiểu Việt Nam '1.234,5' thành float."""
+    return float(value.replace(".", "").replace(",", "."))
 
 class EVNAPI:
     def __init__(self, hass: HomeAssistant, is_new_session=False):
@@ -82,22 +137,22 @@ class EVNAPI:
         if (username is None) or (password is None):
             return CONF_ERR_UNKNOWN
 
-        if evn_area.get("name") == EVN_NAME.HCMC:
-            return await self.login_evnhcmc(username, password)
+        name = evn_area.get("name")
 
-        elif evn_area.get("name") == EVN_NAME.HANOI:
-            return await self.login_evnhanoi(username, password)
-
-        elif evn_area.get("name") == EVN_NAME.CPC:
-            return await self.login_evncpc(username, password)
-
-        elif evn_area.get("name") == EVN_NAME.SPC:
+        if name == EVN_NAME.SPC:
             return await self.login_evnspc(username, password, customer_id)
 
-        elif evn_area.get("name") == EVN_NAME.NPC:
-            return await self.login_evnnpc(username, password)
+        login_fn = {
+            EVN_NAME.HCMC: self.login_evnhcmc,
+            EVN_NAME.HANOI: self.login_evnhanoi,
+            EVN_NAME.CPC: self.login_evncpc,
+            EVN_NAME.NPC: self.login_evnnpc,
+        }.get(name)
 
-        return CONF_ERR_UNKNOWN
+        if login_fn is None:
+            return CONF_ERR_UNKNOWN
+
+        return await login_fn(username, password)
 
     async def request_update(
         self, evn_area: Area, username, password, customer_id, monthly_start=None
@@ -106,35 +161,35 @@ class EVNAPI:
 
         self._evn_area = evn_area
 
-        fetch_data = {}        
-        
-        from_date, to_date = generate_datetime(1 if evn_area.get("name") == EVN_NAME.CPC else monthly_start, offset=1)
+        name = evn_area.get("name")
+        fetch_data = {}
 
-        if evn_area.get("name") == EVN_NAME.CPC:
+        if name == EVN_NAME.CPC:
+            # EVNCPC trả sẵn today/yesterday/this-month -> không cần khoảng ngày
             fetch_data = await self.request_update_evncpc(customer_id)
-            
-        elif evn_area.get("name") == EVN_NAME.HANOI:            
-            fetch_data = await self.request_update_evnhanoi(
-                username, password, customer_id, from_date, to_date
-            )
 
-        elif evn_area.get("name") == EVN_NAME.SPC:
-            fetch_data = await self.request_update_evnspc(
-                customer_id, from_date, to_date
-            )
+        elif name in (EVN_NAME.HANOI, EVN_NAME.HCMC, EVN_NAME.SPC, EVN_NAME.NPC):
+            from_date, to_date = generate_datetime(monthly_start, offset=1)
 
-        elif evn_area.get("name") == EVN_NAME.NPC:
-            fetch_data = await self.request_update_evnnpc(
-                customer_id, from_date, to_date
-            )
-
-        elif evn_area.get("name") == EVN_NAME.HCMC:
-            fetch_data = await self.request_update_evnhcmc(
-                username, password, customer_id, from_date, to_date
-            )
+            if name == EVN_NAME.HANOI:
+                fetch_data = await self.request_update_evnhanoi(
+                    username, password, customer_id, from_date, to_date
+                )
+            elif name == EVN_NAME.HCMC:
+                fetch_data = await self.request_update_evnhcmc(
+                    username, password, customer_id, from_date, to_date
+                )
+            elif name == EVN_NAME.SPC:
+                fetch_data = await self.request_update_evnspc(
+                    customer_id, from_date, to_date
+                )
+            else:
+                fetch_data = await self.request_update_evnnpc(
+                    customer_id, from_date, to_date
+                )
 
         if not fetch_data:
-            _LOGGER.error("Unsupported EVN area: %s", evn_area.get("name"))
+            _LOGGER.error("Unsupported EVN area: %s", name)
             return {"status": CONF_ERR_UNKNOWN, "data": "Unsupported EVN area"}
 
         if fetch_data.get("status") == CONF_SUCCESS:
@@ -146,7 +201,7 @@ class EVNAPI:
         """Create EVN login session corresponding with EVNHANOI Endpoint"""
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Accept": "application/json",
             "Connection": "keep-alive",
         }
@@ -177,14 +232,14 @@ class EVNAPI:
                 self._evn_area["token_expiry"] = time.time() + expires_in
             return CONF_SUCCESS
 
-        _LOGGER.error(f"Error while logging in EVN Endpoints: {resp_json}")
+        _LOGGER.error("Error while logging in EVN Endpoints: %s", resp_json)
         return CONF_ERR_UNKNOWN
 
     async def login_evnhcmc(self, username, password) -> str:
         """Create EVN login session corresponding with EVNHCMC Endpoint"""
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -192,7 +247,7 @@ class EVNAPI:
 
         payload = {"u": username, "p": password}
 
-        ssl_context = await self.hass.async_add_executor_job(create_ssl_context)
+        ssl_context = await async_get_ssl_context(self.hass, legacy=True)
 
         resp = await self._session.post(
             url=self._evn_area.get("evn_login_url"),
@@ -224,10 +279,10 @@ class EVNAPI:
                 else:
                     self._evn_area.pop("expires", None)
 
-                _LOGGER.info("Login successful. Session: %s", cookie_morsel.value)
+                _LOGGER.debug("EVNHCMC login successful")
                 return CONF_SUCCESS
 
-        _LOGGER.error(f"Unable to login into EVN Endpoint: {resp_json}")
+        _LOGGER.error("Unable to login into EVN Endpoint: %s", resp_json)
         return CONF_ERR_INVALID_AUTH
 
     async def login_evnnpc(self, username, password) -> str:
@@ -242,7 +297,7 @@ class EVNAPI:
         ).decode()
 
         headers = {
-            "User-Agent": "NPCApp/1 CFNetwork/1240.0.4 Darwin/20.6.0",
+            "User-Agent": UA_NPC,
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
@@ -250,7 +305,7 @@ class EVNAPI:
             "Authorization": f"Basic {auth_header}",
         }
 
-        ssl_context = await self.hass.async_add_executor_job(create_ssl_context)
+        ssl_context = await async_get_ssl_context(self.hass, legacy=True)
 
         resp = await self._session.post(
             url=self._evn_area.get("evn_login_url"),
@@ -286,7 +341,7 @@ class EVNAPI:
 
         headers = {
             "Authorization": f"Basic {auth_header}",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -307,7 +362,7 @@ class EVNAPI:
             self._evn_area["access_token"] = resp_json["access_token"]
             return CONF_SUCCESS
 
-        _LOGGER.error(f"Error while logging in EVN Endpoints: {resp_json}")
+        _LOGGER.error("Error while logging in EVN Endpoints: %s", resp_json)
         return CONF_ERR_UNKNOWN
 
     async def login_evnspc(self, username, password, customer_id) -> str:
@@ -320,7 +375,7 @@ class EVNAPI:
         }
 
         headers = {
-            "User-Agent": "evnapp/59 CFNetwork/1240.0.4 Darwin/20.6.0",
+            "User-Agent": UA_SPC,
             "Accept-Language": "vi-vn",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -357,10 +412,10 @@ class EVNAPI:
             login_status = await self.login_evnhanoi(username, password)
             if login_status != CONF_SUCCESS:
                 raise ConfigEntryNotReady("Token expired and failed to reauthenticate")
-                    
+
         headers = {
             "Authorization": f"Bearer {self._evn_area.get('access_token')}",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Content-Type": "application/json",
             "Connection": "keep-alive",
         }
@@ -373,7 +428,7 @@ class EVNAPI:
             "ngayCuoi": to_date,
         }
 
-        ssl_context = await self.hass.async_add_executor_job(ssl.create_default_context)
+        ssl_context = await async_get_ssl_context(self.hass)
 
         resp = await self._session.post(
             url=self._evn_area.get("evn_data_url"),
@@ -398,35 +453,23 @@ class EVNAPI:
 
                 return {"status": CONF_ERR_INVALID_ID, "data": resp_json}
 
-            _LOGGER.error(f"Cannot request new data from EVN Server: {resp_json}")
+            _LOGGER.error("Cannot request new data from EVN Server: %s", resp_json)
 
             return {"status": resp_json.get("code"), "data": resp_json}
 
         sub_data = resp_json["data"]["chiSoNgay"]
 
-        from_date = parser.parse(sub_data[0]["ngay"], dayfirst=True)
-        to_date = parser.parse(
-            sub_data[(-1 if len(sub_data) > 1 else 0)]["ngay"], dayfirst=True
-        ) - timedelta(days=1)
-        previous_date = parser.parse(
-            sub_data[(-2 if len(sub_data) > 2 else 0)]["ngay"], dayfirst=True
-        ) - timedelta(days=1)
+        first, last = sub_data[0], sub_data[-1]
+        prev, prev2 = _pick(sub_data, 2), _pick(sub_data, 3)
 
-        econ_total_new = round(
-            float(str(sub_data[(-1 if len(sub_data) > 1 else 0)]["sg"])), 2
-        )
-        econ_total_old = round(float(str(sub_data[0]["sg"])), 2)
+        from_date = parser.parse(first["ngay"], dayfirst=True)
+        to_date = parser.parse(last["ngay"], dayfirst=True) - timedelta(days=1)
+        previous_date = parser.parse(prev["ngay"], dayfirst=True) - timedelta(days=1)
 
-        econ_daily_new = round(
-            float(sub_data[(-1 if len(sub_data) > 1 else 0)]["sg"])
-            - float(sub_data[(-2 if len(sub_data) > 2 else 0)]["sg"]),
-            2,
-        )
-        econ_daily_old = round(
-            float(sub_data[(-2 if len(sub_data) > 2 else 0)]["sg"])
-            - float(sub_data[(-3 if len(sub_data) > 3 else 0)]["sg"]),
-            2,
-        )
+        econ_total_new = round(float(last["sg"]), 2)
+        econ_total_old = round(float(first["sg"]), 2)
+        econ_daily_new = round(float(last["sg"]) - float(prev["sg"]), 2)
+        econ_daily_old = round(float(prev["sg"]) - float(prev2["sg"]), 2)
 
         fetched_data = {
             "status": CONF_SUCCESS,
@@ -457,13 +500,10 @@ class EVNAPI:
         m_payment_status = 0
 
         if status == CONF_SUCCESS and not resp_json["isError"]:
-            if len(resp_json["data"]["listThongTinNoKhachHangVm"]):
+            debts = resp_json["data"]["listThongTinNoKhachHangVm"]
+            if debts:
                 payment_status = STATUS_PAYMENT_NEEDED
-                m_payment_status = int(
-                    resp_json["data"]["listThongTinNoKhachHangVm"][0][
-                        "tongTien"
-                    ].replace(".", "")
-                )
+                m_payment_status = int(debts[0]["tongTien"].replace(".", ""))
             else:
                 payment_status = STATUS_N_PAYMENT_NEEDED
 
@@ -480,31 +520,22 @@ class EVNAPI:
     async def request_update_evnhcmc(self, username, password, customer_id, from_date, to_date):
         """Request new update from EVNHCMC Server"""
 
-        evn_session_expires = self._evn_area.get("expires")
-        if isinstance(evn_session_expires, datetime):
-            evn_session_expires = evn_session_expires.astimezone(timezone.utc)
-        else:    
-            evn_session_expires = None
+        expires = self._evn_area.get("expires")
 
-        if not evn_session_expires:
-            login_status = await self.login_evnhcmc(username, password)
-            if login_status != CONF_SUCCESS:
-                raise ConfigEntryNotReady("Failed to reauthenticate due to invalid session expiration.")
-        elif datetime.now(tz=timezone.utc) >= evn_session_expires:
-            _LOGGER.info("Session expired. Attempting to login again...")
-            login_status = await self.login_evnhcmc(username, password)
-            if login_status != CONF_SUCCESS:
-                raise ConfigEntryNotReady("Session expired and failed to reauthenticate")       
+        if not isinstance(expires, datetime) or datetime.now(tz=timezone.utc) >= expires:
+            _LOGGER.debug("EVNHCMC session missing/expired, logging in again")
+            if await self.login_evnhcmc(username, password) != CONF_SUCCESS:
+                raise ConfigEntryNotReady("Session expired and failed to reauthenticate")
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Cookie": f"evn_session={self._evn_area.get('evn_session')}",
         }
 
-        ssl_context = await self.hass.async_add_executor_job(ssl.create_default_context)
+        ssl_context = await async_get_ssl_context(self.hass)
 
         resp = await self._session.post(
             url=self._evn_area.get("evn_data_url"),
@@ -532,48 +563,23 @@ class EVNAPI:
             )
             return {"status": state, "data": resp_json}
 
-        resp_json = resp_json["data"]["sanluong_tungngay"]
+        days = resp_json["data"]["sanluong_tungngay"]
+        first, last = days[0], days[-1]
+        latest, prev = _pick(days, 2), _pick(days, 3)
 
-        from_date = strip_date_range(resp_json[0]["ngayFull"])
-        to_date = strip_date_range(
-            resp_json[(-2 if len(resp_json) > 2 else 0)]["ngayFull"]
-        )
-        previous_date = strip_date_range(
-            resp_json[(-3 if len(resp_json) > 3 else 0)]["ngayFull"]
-        )
+        from_date = strip_date_range(first["ngayFull"])
+        to_date = strip_date_range(latest["ngayFull"])
+        previous_date = strip_date_range(prev["ngayFull"])
 
-        econ_total_new = round(
-            float(
-                str(
-                    resp_json[(-1 if len(resp_json) > 1 else 0)]["tong_p_giao"]
-                ).replace(",", "")
-            ),
-            2,
-        )
-        econ_total_old = round(
-            float(str(resp_json[0]["tong_p_giao"]).replace(",", "")), 2
-        )
+        econ_total_new = round(_num(last["tong_p_giao"]), 2)
+        econ_total_old = round(_num(first["tong_p_giao"]), 2)
 
         fetched_data = {
             "status": CONF_SUCCESS,
             ID_ECON_TOTAL_OLD: econ_total_old,
             ID_ECON_TOTAL_NEW: econ_total_new,
-            ID_ECON_DAILY_NEW: round(
-                float(
-                    str(resp_json[(-2 if len(resp_json) > 2 else 0)]["Tong"]).replace(
-                        ",", ""
-                    )
-                ),
-                2,
-            ),
-            ID_ECON_DAILY_OLD: round(
-                float(
-                    str(resp_json[(-3 if len(resp_json) > 3 else 0)]["Tong"]).replace(
-                        ",", ""
-                    )
-                ),
-                2,
-            ),
+            ID_ECON_DAILY_NEW: round(_num(latest["Tong"]), 2),
+            ID_ECON_DAILY_OLD: round(_num(prev["Tong"]), 2),
             ID_ECON_MONTHLY_NEW: round(econ_total_new - econ_total_old, 2),
             "to_date": to_date.date(),
             "from_date": from_date.date(),
@@ -592,19 +598,17 @@ class EVNAPI:
         m_payment_status = 0
 
         if status == CONF_SUCCESS:
-            if "isNo" in resp_json["data"]:
-                if resp_json["data"].get("isNo") == 1:
-                    payment_status = STATUS_PAYMENT_NEEDED
+            pay_data = resp_json["data"]
+            is_no = pay_data.get("isNo")
 
-                    if "info_no" in resp_json["data"]:
-                        m_payment_status = int(
-                            resp_json["data"]["info_no"]
-                            .get("TONG_TIEN")
-                            .replace(".", "")
-                        )
-
-                elif resp_json["data"].get("isNo") == 0:
-                    payment_status = STATUS_N_PAYMENT_NEEDED
+            if is_no == 1:
+                payment_status = STATUS_PAYMENT_NEEDED
+                if "info_no" in pay_data:
+                    m_payment_status = int(
+                        pay_data["info_no"].get("TONG_TIEN").replace(".", "")
+                    )
+            elif is_no == 0:
+                payment_status = STATUS_N_PAYMENT_NEEDED
 
         fetched_data.update(
             {ID_PAYMENT_NEEDED: payment_status, ID_M_PAYMENT_NEEDED: m_payment_status}
@@ -624,13 +628,13 @@ class EVNAPI:
         }
 
         headers = {
-            "User-Agent": "NPCApp/1 CFNetwork/1240.0.4 Darwin/20.6.0",
+            "User-Agent": UA_NPC,
             "Content-Type": "application/json",
             "Connection": "keep-alive",
             "Authorization": f"Bearer {self._evn_area.get('access_token')}",
         }
 
-        ssl_context = await self.hass.async_add_executor_job(ssl.create_default_context)
+        ssl_context = await async_get_ssl_context(self.hass)
 
         resp = await self._session.post(
             url=self._evn_area.get("evn_data_url"),
@@ -643,49 +647,37 @@ class EVNAPI:
         if status != CONF_SUCCESS:
             return resp_json
 
-        valid_info = []
+        # Dữ liệu NPC sắp xếp mới nhất trước: [0] = ngày gần nhất, [-1] = đầu kỳ
+        valid_info = [
+            item
+            for item in resp_json
+            if item.get("GHI_CHU") == "Sản lượng điện tiêu thụ của khách hàng"
+            and item.get("LOAI_CHI_SO") == "P"
+        ]
 
-        for each_entity in resp_json:
-            if "GHI_CHU" in each_entity and "LOAI_CHI_SO" in each_entity:
-                if (
-                    each_entity.get("GHI_CHU")
-                    == "Sản lượng điện tiêu thụ của khách hàng"
-                    and each_entity.get("LOAI_CHI_SO") == "P"
-                ):
-                    valid_info.append(each_entity)
-
-        if valid_info == []:
+        if not valid_info:
             return {
                 "status": CONF_ERR_NO_MONITOR,
                 "data": str(resp_json[0]),
             }
 
-        from_date = parser.parse(
-            valid_info[(-1 if len(valid_info) > 1 else 0)]["THOI_GIAN_BAT_DAU"]
-        )
-        to_date = parser.parse(valid_info[0]["THOI_GIAN_BAT_DAU"])
-        previous_date = parser.parse(
-            valid_info[(1 if len(valid_info) > 1 else 0)]["THOI_GIAN_BAT_DAU"]
-        )
+        newest, oldest = valid_info[0], valid_info[-1]
+        second = valid_info[1] if len(valid_info) > 1 else newest
+
+        from_date = parser.parse(oldest["THOI_GIAN_BAT_DAU"])
+        to_date = parser.parse(newest["THOI_GIAN_BAT_DAU"])
+        previous_date = parser.parse(second["THOI_GIAN_BAT_DAU"])
+
+        econ_total_new = float(newest["CHI_SO_KET_THUC"])
+        econ_total_old = float(oldest["CHI_SO_BAT_DAU"])
 
         fetched_data = {
             "status": CONF_SUCCESS,
-            ID_ECON_TOTAL_NEW: round(float(valid_info[0]["CHI_SO_KET_THUC"]), 2),
-            ID_ECON_TOTAL_OLD: round(
-                float(valid_info[(-1 if len(valid_info) > 1 else 0)]["CHI_SO_BAT_DAU"]),
-                2,
-            ),
-            ID_ECON_DAILY_NEW: round(float(valid_info[0]["SAN_LUONG"]), 2),
-            ID_ECON_DAILY_OLD: round(
-                float(valid_info[(1 if len(valid_info) > 1 else 0)]["SAN_LUONG"]), 2
-            ),
-            ID_ECON_MONTHLY_NEW: round(
-                float(valid_info[0]["CHI_SO_KET_THUC"])
-                - float(
-                    valid_info[(-1 if len(valid_info) > 1 else 0)]["CHI_SO_BAT_DAU"]
-                ),
-                2,
-            ),
+            ID_ECON_TOTAL_NEW: round(econ_total_new, 2),
+            ID_ECON_TOTAL_OLD: round(econ_total_old, 2),
+            ID_ECON_DAILY_NEW: round(float(newest["SAN_LUONG"]), 2),
+            ID_ECON_DAILY_OLD: round(float(second["SAN_LUONG"]), 2),
+            ID_ECON_MONTHLY_NEW: round(econ_total_new - econ_total_old, 2),
             "from_date": from_date.date(),
             "to_date": to_date.date(),
             "previous_date": previous_date.date(),
@@ -702,21 +694,14 @@ class EVNAPI:
         m_payment_status = 0
 
         if status == CONF_SUCCESS and "data" in resp_json:
-            if "customerInfo" in resp_json["data"] and "invoice" in resp_json[
-                "data"
-            ].get("customerInfo"):
-                if len(resp_json["data"]["customerInfo"]["invoice"]):
-                    paid_status = resp_json["data"]["customerInfo"]["invoice"][0].get(
-                        "paid"
-                    )
+            invoices = (resp_json["data"].get("customerInfo") or {}).get("invoice")
 
-                    if paid_status:
-                        payment_status = STATUS_N_PAYMENT_NEEDED
-                    else:
-                        payment_status = STATUS_PAYMENT_NEEDED
-                        m_payment_status = resp_json["data"]["customerInfo"]["invoice"][
-                            0
-                        ].get("paymentTotalAmount")
+            if invoices:
+                if invoices[0].get("paid"):
+                    payment_status = STATUS_N_PAYMENT_NEEDED
+                else:
+                    payment_status = STATUS_PAYMENT_NEEDED
+                    m_payment_status = invoices[0].get("paymentTotalAmount")
 
         fetched_data.update(
             {
@@ -732,7 +717,7 @@ class EVNAPI:
 
         headers = {
             "Authorization": f"Bearer {self._evn_area.get('access_token')}",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+            "User-Agent": UA_BROWSER,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -748,18 +733,15 @@ class EVNAPI:
         if status != CONF_SUCCESS:
             return resp_json
 
+        consumption = resp_json["electricConsumption"]
         fetched_data = {
             "status": CONF_SUCCESS,
-            ID_ECON_DAILY_NEW: round(
-                float(resp_json["electricConsumption"]["electricConsumptionToday"]), 2
-            ),
+            ID_ECON_DAILY_NEW: round(float(consumption["electricConsumptionToday"]), 2),
             ID_ECON_DAILY_OLD: round(
-                float(resp_json["electricConsumption"]["electricConsumptionYesterday"]),
-                2,
+                float(consumption["electricConsumptionYesterday"]), 2
             ),
             ID_ECON_MONTHLY_NEW: round(
-                float(resp_json["electricConsumption"]["electricConsumptionThisMonth"]),
-                2,
+                float(consumption["electricConsumptionThisMonth"]), 2
             ),
         }
 
@@ -776,21 +758,19 @@ class EVNAPI:
         m_payment_status = 0
         payment_status = CONF_ERR_UNKNOWN
 
-        if resp_json["status"] == 0:
-            if "tinhTrangThanhToan" in resp_json["response"]:
-                if resp_json["response"].get("tinhTrangThanhToan") == "Đã thanh toán":
-                    payment_status = STATUS_N_PAYMENT_NEEDED
-                else:
-                    payment_status = STATUS_PAYMENT_NEEDED
+        info = resp_json["response"]
 
-                    if "tienHoaDon" in resp_json["response"]:
-                        m_payment_status = int(
-                            resp_json["response"]["tienHoaDon"]
-                            .replace(".", "")
-                            .replace("đ", "")
-                        )
+        if resp_json["status"] == 0 and "tinhTrangThanhToan" in info:
+            if info["tinhTrangThanhToan"] == "Đã thanh toán":
+                payment_status = STATUS_N_PAYMENT_NEEDED
+            else:
+                payment_status = STATUS_PAYMENT_NEEDED
+                if "tienHoaDon" in info:
+                    m_payment_status = int(
+                        info["tienHoaDon"].replace(".", "").replace("đ", "")
+                    )
 
-        current_einfo = resp_json["response"].get("dienNangHienTai")
+        current_einfo = info.get("dienNangHienTai")
 
         try:
             to_date = datetime.strptime(
@@ -803,21 +783,8 @@ class EVNAPI:
             {
                 ID_PAYMENT_NEEDED: payment_status,
                 ID_M_PAYMENT_NEEDED: m_payment_status,
-                ID_ECON_TOTAL_NEW: round(
-                    float(
-                        current_einfo.get("chiSo").replace(".", "").replace(",", ".")
-                    ),
-                    2,
-                ),
-                ID_ECON_TOTAL_OLD: round(
-                    float(
-                        resp_json["response"]
-                        .get("chiSoCuoiKy")
-                        .replace(".", "")
-                        .replace(",", ".")
-                    ),
-                    2,
-                ),
+                ID_ECON_TOTAL_NEW: round(_vn_num(current_einfo.get("chiSo")), 2),
+                ID_ECON_TOTAL_OLD: round(_vn_num(info.get("chiSoCuoiKy")), 2),
                 "to_date": to_date,
                 "previous_date": to_date - timedelta(days=1),
             }
@@ -834,7 +801,7 @@ class EVNAPI:
         to_date_str = parser.parse(to_date, dayfirst=True).strftime("%Y%m%d")
 
         headers = {
-            "User-Agent": "evnapp/59 CFNetwork/1240.0.4 Darwin/20.6.0",
+            "User-Agent": UA_SPC,
             "Authorization": f"Bearer {self._evn_area.get('access_token')}",
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
@@ -860,25 +827,27 @@ class EVNAPI:
                 "data": resp_json,
             }
 
-        from_date = parser.parse(resp_json[0]["strTime"], dayfirst=True) + timedelta(days=1)
-        to_date = parser.parse(
-            resp_json[(-1 if len(resp_json) > 1 else 0)]["strTime"], dayfirst=True
-        )
-        previous_date = parser.parse(
-            resp_json[(-2 if len(resp_json) > 2 else 0)]["strTime"], dayfirst=True
-        )
+        first, last = resp_json[0], resp_json[-1]
+
+        from_date = parser.parse(first["strTime"], dayfirst=True) + timedelta(days=1)
+        to_date = parser.parse(last["strTime"], dayfirst=True)
+        previous_date = parser.parse(_pick(resp_json, 2)["strTime"], dayfirst=True)
+
+        econ_total_old = safe_float(first.get("dGiaoBT"))
+        econ_total_new = safe_float(last.get("dGiaoBT"))
 
         fetched_data = {
             "status": CONF_SUCCESS,
-            ID_ECON_TOTAL_OLD: round(safe_float(resp_json[0].get("dGiaoBT")), 2),
-            ID_ECON_TOTAL_NEW: round(safe_float(resp_json[-1].get("dGiaoBT")), 2),
-            ID_ECON_DAILY_NEW: round(safe_float(resp_json[-1].get("dSanLuongBT")), 2),
+            ID_ECON_TOTAL_OLD: round(econ_total_old, 2),
+            ID_ECON_TOTAL_NEW: round(econ_total_new, 2),
+            ID_ECON_DAILY_NEW: round(safe_float(last.get("dSanLuongBT")), 2),
             ID_ECON_DAILY_OLD: round(
-                safe_float(resp_json[-2].get("dSanLuongBT")) if len(resp_json) > 1 else 0.0, 2
+                safe_float(resp_json[-2].get("dSanLuongBT"))
+                if len(resp_json) > 1
+                else 0.0,
+                2,
             ),
-            ID_ECON_MONTHLY_NEW: round(
-                safe_float(resp_json[-1].get("dGiaoBT")) - safe_float(resp_json[0].get("dGiaoBT"))
-            ),
+            ID_ECON_MONTHLY_NEW: round(econ_total_new - econ_total_old, 2),
             "to_date": to_date.date(),
             "from_date": from_date.date(),
             "previous_date": previous_date.date(),
@@ -891,21 +860,17 @@ class EVNAPI:
                 "strMaKH": f"{customer_id}",
             },
             session=self._session,
-            allow_empty=True,
             api_name="Payment data"
         )
 
-        if status == CONF_SUCCESS and resp_json and isinstance(resp_json, list) and resp_json:
-            m_payment_status = int(resp_json[0].get("lTongTien", 0))
-            fetched_data.update({
-                ID_PAYMENT_NEEDED: STATUS_PAYMENT_NEEDED,
-                ID_M_PAYMENT_NEEDED: m_payment_status
-            })
+        if status == CONF_SUCCESS and isinstance(resp_json, list) and resp_json:
+            fetched_data[ID_PAYMENT_NEEDED] = STATUS_PAYMENT_NEEDED
+            fetched_data[ID_M_PAYMENT_NEEDED] = int(resp_json[0].get("lTongTien", 0))
         else:
-            fetched_data.update({
-                ID_PAYMENT_NEEDED: STATUS_N_PAYMENT_NEEDED if status == CONF_EMPTY else CONF_ERR_UNKNOWN,
-                ID_M_PAYMENT_NEEDED: 0
-            })
+            fetched_data[ID_PAYMENT_NEEDED] = (
+                STATUS_N_PAYMENT_NEEDED if status == CONF_EMPTY else CONF_ERR_UNKNOWN
+            )
+            fetched_data[ID_M_PAYMENT_NEEDED] = 0
 
         status, resp_json = await fetch_with_retries(
             url=self._evn_area.get("evn_loadshedding_url"),
@@ -917,66 +882,49 @@ class EVNAPI:
             api_name="EVN loadshedding data"
         )
 
-        fetched_data[ID_LOADSHEDDING] = (
-            resp_json[0].get("strThoiGianMatDien") if resp_json else STATUS_LOADSHEDDING if status == CONF_EMPTY else CONF_ERR_UNKNOWN
-        )
+        if status == CONF_SUCCESS and isinstance(resp_json, list) and resp_json:
+            fetched_data[ID_LOADSHEDDING] = resp_json[0].get("strThoiGianMatDien")
+        else:
+            fetched_data[ID_LOADSHEDDING] = (
+                STATUS_LOADSHEDDING if status == CONF_EMPTY else CONF_ERR_UNKNOWN
+            )
 
         return fetched_data
 
-    async def get_evn_info(self, customer_id):
-        """Get EVN branch info"""
-        file_path = os.path.join(os.path.dirname(__file__), "evn_branches.json")
 
-        async def async_load_json():
-            try:
-                return await self.hass.async_add_executor_job(read_evn_branches_file, file_path)
-            except Exception as ex:
-                _LOGGER.error("Error loading EVN branch info: %s", str(ex))
-                return None
+_HTTP_ERROR_STATUS = {
+    400: CONF_ERR_INVALID_AUTH,
+    401: CONF_ERR_INVALID_AUTH,
+    405: CONF_ERR_NOT_SUPPORTED,
+}
 
-        return await async_load_json()
 
 async def json_processing(resp):
-    resp_json: dict = {}
+    """Parse an aiohttp response -> (status, json | error dict)."""
 
     if resp.status != 200:
-
-        if resp.status == 401 or resp.status == 400:
-            return CONF_ERR_INVALID_AUTH, {
-                "status": CONF_ERR_INVALID_AUTH,
-                "data": resp.status,
-            }
-
-        if resp.status == 405:
-            return CONF_ERR_NOT_SUPPORTED, {
-                "status": CONF_ERR_NOT_SUPPORTED,
-                "data": resp.status,
-            }
-
-        _LOGGER.error(
-            f"Cannot connect to EVN Server while requesting new data: status code {resp.status}"
-        )
-        return CONF_ERR_CANNOT_CONNECT, {
-            "status": CONF_ERR_CANNOT_CONNECT,
-            "data": resp.status,
-        }
+        state = _HTTP_ERROR_STATUS.get(resp.status, CONF_ERR_CANNOT_CONNECT)
+        if state == CONF_ERR_CANNOT_CONNECT:
+            _LOGGER.error(
+                "Cannot connect to EVN Server while requesting new data: status code %s",
+                resp.status,
+            )
+        resp.release()
+        return state, {"status": state, "data": resp.status}
 
     try:
-        res = await resp.text()
-        resp_json = json.loads(res, strict=False)
-
-        state = CONF_SUCCESS if bool(resp_json) else CONF_EMPTY
-
+        resp_json = json.loads(await resp.text(), strict=False)
     except Exception as error:
         _LOGGER.error(
-            f"Unable to fetch data from EVN Server while requesting new data: {error}"
+            "Unable to fetch data from EVN Server while requesting new data: %s", error
         )
         return CONF_ERR_UNKNOWN, {"status": CONF_ERR_UNKNOWN, "data": error}
 
-    if state != CONF_SUCCESS:
-        return state, {"status": state, "data": resp_json}
+    if not resp_json:
+        return CONF_EMPTY, {"status": CONF_EMPTY, "data": resp_json}
 
     return CONF_SUCCESS, resp_json
+
 
 def formatted_result(raw_data: dict) -> dict:
     res = {}
@@ -1048,61 +996,46 @@ def formatted_result(raw_data: dict) -> dict:
             "info": info,
         }
 
+    payment = raw_data[ID_PAYMENT_NEEDED]
     res[ID_PAYMENT_NEEDED] = {
-        "value": (
-            None
-            if (
-                raw_data[ID_PAYMENT_NEEDED] != STATUS_N_PAYMENT_NEEDED
-                and raw_data[ID_PAYMENT_NEEDED] != STATUS_PAYMENT_NEEDED
-            )
-            else raw_data[ID_PAYMENT_NEEDED]
-        ),
-        "info": (
-            "mdi:comment-alert-outline"
-            if raw_data[ID_PAYMENT_NEEDED] == STATUS_PAYMENT_NEEDED
-            else (
-                "mdi:comment-check-outline"
-                if raw_data[ID_PAYMENT_NEEDED] == STATUS_N_PAYMENT_NEEDED
-                else "mdi:comment-question-outline"
-            )
-        ),
+        "value": payment if payment in _PAYMENT_ICONS else None,
+        "info": _PAYMENT_ICONS.get(payment, "mdi:comment-question-outline"),
     }
 
+    m_payment = raw_data.get(ID_M_PAYMENT_NEEDED) or 0
     res[ID_M_PAYMENT_NEEDED] = {
-        "value": str(raw_data[ID_M_PAYMENT_NEEDED]),
+        "value": str(m_payment),
         "info": (
             "mdi:alert-circle-outline"
-            if raw_data[ID_M_PAYMENT_NEEDED] > 0
+            if float(m_payment) > 0
             else "mdi:checkbox-marked-circle-outline"
         ),
     }
 
-    if raw_data.get(ID_LOADSHEDDING) is not None:
-        original_content = raw_data.get(ID_LOADSHEDDING)
-        formatted_content = (
-            format_loadshedding(original_content)
-            if original_content
-            else STATUS_LOADSHEDDING
-        )
-    else:
+    loadshedding = raw_data.get(ID_LOADSHEDDING)
+    if loadshedding is None:
         formatted_content = "Không hỗ trợ"
+    else:
+        formatted_content = format_loadshedding(loadshedding)
 
     res[ID_LOADSHEDDING] = {
         "value": formatted_content,
         "info": "mdi:transmission-tower-off",
     }
 
-    if ID_FROM_DATE in raw_data:
-        res[ID_FROM_DATE] = {"value": raw_data.get("from_date").strftime("%d/%m/%Y")}
-    else:
-        first_day_of_month = datetime.now().replace(day=1)
-        res[ID_FROM_DATE] = {"value": first_day_of_month.strftime("%d/%m/%Y")}
-
-    res[ID_TO_DATE] = {"value": raw_data.get("to_date").strftime("%d/%m/%Y")}
-
+    from_date = raw_data.get(ID_FROM_DATE) or time_obj.replace(day=1)
+    res[ID_FROM_DATE] = {"value": from_date.strftime("%d/%m/%Y")}
+    res[ID_TO_DATE] = {"value": raw_data["to_date"].strftime("%d/%m/%Y")}
     res[ID_LATEST_UPDATE] = {"value": time_obj.astimezone()}
 
     return res
+
+
+_PAYMENT_ICONS = {
+    STATUS_PAYMENT_NEEDED: "mdi:comment-alert-outline",
+    STATUS_N_PAYMENT_NEEDED: "mdi:comment-check-outline",
+}
+
 
 def generate_datetime(monthly_start=1, offset=0):
     """Generate Datetime as string for requesting data purposes"""
@@ -1122,59 +1055,45 @@ def generate_datetime(monthly_start=1, offset=0):
     #           - Latest e-consumption data on 10/09/2022
     #           - E-monitor value at 23:59 10/09/2022
 
-    from_date = ""
-    time_obj = datetime.now()
+    now = datetime.now()
+    start_day = monthly_start - 1 + offset
 
-    current_day = time_obj.day
-    monthly_start_str = "{:0>2}".format(monthly_start - 1 + offset)
+    to_date = (now - timedelta(days=1 - offset)).strftime("%d/%m/%Y")
 
-    to_date = (time_obj - timedelta(days=1 - offset)).strftime("%d/%m/%Y")
-
-    # Example: billing start date is 08/09/2022
-    #           and current date is 09/09/2022
-    if current_day > monthly_start:
-        from_date = f"{monthly_start_str}/{time_obj.strftime('%m/%Y')}"
-
+    # Đã qua ngày chốt kỳ trong tháng này -> kỳ bắt đầu từ tháng này,
+    # ngược lại kỳ bắt đầu từ tháng trước (tháng 1 -> tháng 12 năm trước).
+    if now.day > monthly_start:
+        year, month = now.year, now.month
+    elif now.month > 1:
+        year, month = now.year, now.month - 1
     else:
-        last_month = time_obj.month - 1
+        year, month = now.year - 1, 12
 
-        # If current month >= 2
-        if last_month:
-            last_month_str = "{:0>2}".format(last_month)
-            from_date = (
-                f"{monthly_start_str}/{last_month_str}/{time_obj.strftime('%Y')}"
-            )
+    return f"{start_day:02d}/{month:02d}/{year}", to_date
 
-        # If current month == 1
-        #   last_month must be 12 and change Year to Last Year
-        else:
-            last_year = int(time_obj.strftime("%Y")) - 1
-            from_date = f"{monthly_start_str}/12/{last_year}"
 
-    return from_date, to_date
+# (ngưỡng dưới, ngưỡng trên, đơn giá) — tính một lần từ VIETNAM_ECOST_STAGES
+_ECOST_TIERS = tuple(
+    zip(
+        sorted(VIETNAM_ECOST_STAGES),
+        sorted(VIETNAM_ECOST_STAGES)[1:] + [float("inf")],
+        (VIETNAM_ECOST_STAGES[k] for k in sorted(VIETNAM_ECOST_STAGES)),
+    )
+)
+
 
 def calc_ecost(kwh: float) -> str:
     """Calculate electric cost based on e-consumption"""
 
     total_price = 0.0
 
-    e_stage_list = list(VIETNAM_ECOST_STAGES.keys())
-
-    for index, e_stage in enumerate(e_stage_list):
-        if kwh < e_stage:
+    for lower, upper, price in _ECOST_TIERS:
+        if kwh <= lower:
             break
+        total_price += (min(kwh, upper) - lower) * price
 
-        if e_stage == e_stage_list[-1]:
-            total_price += (kwh - e_stage) * VIETNAM_ECOST_STAGES[e_stage]
-        else:
-            next_stage = e_stage_list[index + 1]
-            total_price += (
-                (next_stage - e_stage) if kwh > next_stage else (kwh - e_stage)
-            ) * VIETNAM_ECOST_STAGES[e_stage]
+    return str(int(round((total_price / 100) * (100 + VIETNAM_ECOST_VAT))))
 
-    total_price = int(round((total_price / 100) * (100 + VIETNAM_ECOST_VAT)))
-
-    return str(total_price)
 
 def calc_ecost_delta(prior_kwh: float, new_total_kwh: float) -> str:
     """Calculate the marginal cost of consumption added on top of prior_kwh,
@@ -1185,51 +1104,53 @@ def calc_ecost_delta(prior_kwh: float, new_total_kwh: float) -> str:
 
     return str(max(0, total_cost - prior_cost))
 
+
 def safe_float(value, default=0.0):
     try:
         return float(str(value).replace(",", "")) if value is not None else default
     except ValueError:
         return default
 
+
 def format_loadshedding(raw_value: str) -> str:
     try:
-        if not raw_value or 'đến' not in raw_value:
+        if not raw_value or "đến" not in raw_value:
             return STATUS_LOADSHEDDING
-            
-        start, end = raw_value.replace('từ ', '').replace(' ngày', '').split('đến')
+
+        start, end = raw_value.replace("từ ", "").replace(" ngày", "").split("đến")
         start = start.strip().split()
         end = end.strip().split()
         if len(start) != 2 or len(end) != 2:
             return STATUS_LOADSHEDDING
 
-        start_time, start_date = start
-        end_time, end_date = end
+        (start_time, start_date), (end_time, end_date) = start, end
 
-        start_time = start_time[:-3]
-        end_time = end_time[:-3]
-        start_date = start_date[:-5]
-        end_date = end_date[:-5]
-
-        return f"{start_time} {start_date} - {end_time} {end_date}"
+        return (
+            f"{start_time[:-3]} {start_date[:-5]} - {end_time[:-3]} {end_date[:-5]}"
+        )
 
     except Exception:
         return STATUS_LOADSHEDDING
 
+
 def strip_date_range(date_str):
     if "đến" in date_str:
-        stripped_date = date_str.split("đến")[1].strip()
-    else:
-        stripped_date = date_str.strip()
-    return parser.parse(stripped_date, dayfirst=True)
+        date_str = date_str.split("đến")[1]
+    return parser.parse(date_str.strip(), dayfirst=True)
+
+
+# Lỗi "cố định" — thử lại cũng vô ích
+_NO_RETRY_STATUS = (CONF_ERR_INVALID_AUTH, CONF_ERR_NOT_SUPPORTED)
+
 
 async def fetch_with_retries(
-    url, headers, params, max_retries=3, session=None, allow_empty=False, api_name="API"
+    url, headers, params, max_retries=3, session=None, api_name="API"
 ):
-    """Fetch data with retry mechanism."""
+    """Fetch data with retry mechanism (GET, có backoff giữa các lần thử)."""
     status = CONF_ERR_CANNOT_CONNECT
     resp_json = None
 
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             resp = await session.get(url=url, headers=headers, params=params, ssl=False)
             status, resp_json = await json_processing(resp)
@@ -1237,42 +1158,54 @@ async def fetch_with_retries(
             if status == CONF_EMPTY:
                 return CONF_EMPTY, []
 
-            if status == CONF_SUCCESS or (allow_empty and status == CONF_EMPTY):
+            if status == CONF_SUCCESS:
                 return status, resp_json
 
-            _LOGGER.error(f"Attempt {attempt + 1}/{max_retries} failed for {api_name}: {resp_json}")
+            _LOGGER.warning(
+                "Attempt %s/%s failed for %s: %s", attempt, max_retries, api_name, resp_json
+            )
+
+            if status in _NO_RETRY_STATUS:
+                break
 
         except Exception as e:
             status = CONF_ERR_UNKNOWN
             resp_json = str(e)
-            _LOGGER.error(f"Attempt {attempt + 1}/{max_retries} encountered an error: {str(e)}")
+            _LOGGER.warning(
+                "Attempt %s/%s for %s encountered an error: %s",
+                attempt,
+                max_retries,
+                api_name,
+                e,
+            )
 
-    _LOGGER.error(f"Failed to fetch data of {api_name} after {max_retries} attempts.")
+        if attempt < max_retries:
+            await asyncio.sleep(attempt)
+
+    _LOGGER.error("Failed to fetch data of %s after %s attempts.", api_name, attempt)
     return status, resp_json
+
 
 def get_evn_info_sync(customer_id: str, branches_data=None):
     """Synchronous helper to get EVN info"""
-    for index, each_area in enumerate(VIETNAM_EVN_AREA):
-        for each_pattern in each_area.pattern:
-            if each_pattern in customer_id:
-                evn_branch = "Unknown"
+    for each_area in VIETNAM_EVN_AREA:
+        if not any(pattern in customer_id for pattern in each_area.pattern):
+            continue
 
-                if branches_data:
-                    for evn_id in branches_data:
-                        if evn_id in customer_id:
-                            evn_branch = branches_data[evn_id]
+        evn_branch = "Unknown"
+        if branches_data:
+            # Giữ nguyên hành vi cũ: mã khớp cuối cùng được ưu tiên
+            for evn_id, branch_name in branches_data.items():
+                if evn_id in customer_id:
+                    evn_branch = branch_name
 
-                return {
-                    "status": CONF_SUCCESS,
-                    "customer_id": customer_id,
-                    "evn_area": asdict(each_area),
-                    "evn_name": each_area.name,
-                    "evn_location": each_area.location,
-                    "evn_branch": evn_branch,
-                }
+        return {
+            "status": CONF_SUCCESS,
+            "customer_id": customer_id,
+            "evn_area": asdict(each_area),
+            "evn_name": each_area.name,
+            "evn_location": each_area.location,
+            "evn_branch": evn_branch,
+        }
 
     return {"status": CONF_ERR_NOT_SUPPORTED}
-
-async def get_evn_info(hass: HomeAssistant, customer_id: str):
-    """Async wrapper for EVN info"""
-    return await hass.async_add_executor_job(get_evn_info_sync, customer_id)

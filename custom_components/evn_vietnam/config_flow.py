@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-import os
 
 import voluptuous as vol
 
@@ -25,26 +24,24 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-CUSTOMER_ID_FIELD = (
-    lambda data: {
-        vol.Required(CONF_CUSTOMER_ID): vol.All(str, vol.Length(min=11, max=13))
-    }
-    if (data.get(CONF_CUSTOMER_ID) is None)
-    else {
-        vol.Required(CONF_CUSTOMER_ID, default=data.get(CONF_CUSTOMER_ID)): vol.All(
-            str, vol.Length(min=11, max=13)
-        )
-    }
-)
+def _required(key: str, data: dict[str, Any]) -> vol.Required:
+    """vol.Required kèm default nếu người dùng đã nhập trước đó."""
+    if data.get(key) is None:
+        return vol.Required(key)
+    return vol.Required(key, default=data[key])
 
-AUTH_FIELD = (
-    lambda data: {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
-    if (data.get(CONF_USERNAME) is None)
-    else {
-        vol.Required(CONF_USERNAME, default=data.get(CONF_USERNAME)): str,
-        vol.Required(CONF_PASSWORD, default=data.get(CONF_PASSWORD)): str,
+
+def CUSTOMER_ID_FIELD(data: dict[str, Any]) -> dict:
+    return {
+        _required(CONF_CUSTOMER_ID, data): vol.All(str, vol.Length(min=11, max=13))
     }
-)
+
+
+def AUTH_FIELD(data: dict[str, Any]) -> dict:
+    return {
+        _required(CONF_USERNAME, data): str,
+        _required(CONF_PASSWORD, data): str,
+    }
 
 DATE_START_FIELD = {
     vol.Required(CONF_MONTHLY_START, default=24): vol.All(int, vol.Range(min=1, max=28))
@@ -60,19 +57,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._user_data = {}
         self._api = None
         self._errors = {}
-        self._branches_data = None
-
-    async def _load_branches_data(self):
-        """Load branches data asynchronously."""
-        try:
-            file_path = os.path.join(os.path.dirname(evn_core.__file__), "evn_branches.json")
-            self._branches_data = await self.hass.async_add_executor_job(
-                evn_core.read_evn_branches_file, file_path
-            )
-        except Exception as ex:
-            _LOGGER.error("Error loading branches data: %s", str(ex))
-            return None
-        return self._branches_data
 
     async def async_step_fulfill_data(
         self, user_input: dict[str, Any] | None = None
@@ -88,12 +72,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             verify_account = await self._try_auth()
 
-            if verify_account is not CONF_SUCCESS:
+            if verify_account != CONF_SUCCESS:
                 self._errors["base"] = verify_account
             else:
                 verify_id = await self._verify_id()
 
-                if verify_id is not CONF_SUCCESS:
+                if verify_id != CONF_SUCCESS:
                     self._errors["base"] = verify_id
                 else:
                     await self.async_set_unique_id(self._user_data[CONF_CUSTOMER_ID])
@@ -104,11 +88,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         title=self._user_data[CONF_CUSTOMER_ID], data=self._user_data
                     )
 
-        data_schema = {}
-
         data_schema = AUTH_FIELD(self._user_data)
 
-        if bool(self._errors):
+        if self._errors:
             data_schema |= CUSTOMER_ID_FIELD(self._user_data)
 
         if self._user_data[CONF_AREA].get("date_needed"):
@@ -126,23 +108,17 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_evn_info(self, user_input=None):
         """Handle EVN-info config flow by the user."""
-        # Load branches data if not already loaded
-        if self._branches_data is None:
-            await self._load_branches_data()
-
-        # Get EVN info using the loaded branches data
-        evn_info = evn_core.get_evn_info_sync(
-            self._user_data[CONF_CUSTOMER_ID],
-            self._branches_data
-        )
+        if user_input is not None:
+            return await self.async_step_fulfill_data()
 
         self._errors = {}
 
-        if user_input is not None:
+        branches = await evn_core.async_load_evn_branches(self.hass)
+        evn_info = evn_core.get_evn_info_sync(
+            self._user_data[CONF_CUSTOMER_ID], branches
+        )
 
-            return await self.async_step_fulfill_data()
-
-        if evn_info.get("status") is CONF_SUCCESS:
+        if evn_info.get("status") == CONF_SUCCESS:
             self._user_data[CONF_AREA] = evn_info["evn_area"]
 
             return self.async_show_form(
@@ -187,13 +163,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._user_data.get(CONF_CUSTOMER_ID),
             )
         except Exception as e:
-            _LOGGER.exception(f"Unexpected exception: {e}")
+            _LOGGER.exception("Unexpected exception: %s", e)
             return CONF_ERR_UNKNOWN
-        else:
-            if res != CONF_SUCCESS:
-                return res
 
-        return CONF_SUCCESS
+        return res
 
     async def _verify_id(self):
         """Try verifying EVN Customer ID given by the user config flow."""
@@ -202,15 +175,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             res = await self._api.request_update(
                 self._user_data.get(CONF_AREA),
                 self._user_data.get(CONF_USERNAME),
-                self._user_data.get(CONF_PASSWORD),                
+                self._user_data.get(CONF_PASSWORD),
                 self._user_data.get(CONF_CUSTOMER_ID),
                 self._user_data.get(CONF_MONTHLY_START),
             )
         except Exception as e:
-            _LOGGER.exception(f"Unexpected exception: {e}")
+            _LOGGER.exception("Unexpected exception: %s", e)
             return CONF_ERR_UNKNOWN
-        else:
-            if res["status"] != CONF_SUCCESS:
-                return res["status"]
 
-        return CONF_SUCCESS
+        return res["status"]

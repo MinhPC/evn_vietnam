@@ -2,7 +2,6 @@
 
 import logging
 from typing import Any
-import os
 
 from homeassistant.components.sensor import (
     DOMAIN as ENTITY_DOMAIN,
@@ -28,7 +27,6 @@ from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_SW_VERSION,
     CONF_ERR_INVALID_AUTH,
-    CONF_ERR_UNKNOWN,
     CONF_MONTHLY_START,
     CONF_PASSWORD,
     CONF_SUCCESS,
@@ -67,7 +65,7 @@ async def async_setup_entry(
     # Dọn entity cũ không còn được tạo (vd loadshedding ở khu vực không hỗ trợ)
     # để tránh entity mồ côi hiển thị "Unavailable".
     created_unique_ids = {
-        f"{evn_device._customer_id}_{description.key}".lower()
+        f"{evn_device.customer_id}_{description.key}".lower()
         for description in descriptions
     }
     registry = er.async_get(hass)
@@ -76,7 +74,7 @@ async def async_setup_entry(
             registry.async_remove(reg_entry.entity_id)
 
     async_add_entities(
-        EVNSensor(evn_device, description, hass) for description in descriptions
+        EVNSensor(evn_device, description) for description in descriptions
     )
 
 
@@ -85,80 +83,82 @@ class EVNDevice:
 
     def __init__(self, dataset, api: evn_core.EVNAPI) -> None:
         """Construct Device wrapper."""
-        self._name = f"{CONF_DEVICE_NAME}: {dataset[CONF_CUSTOMER_ID]}"
-        self._coordinator: DataUpdateCoordinator = None
         self.hass = api.hass
+        self._api = api
+        self._coordinator: DataUpdateCoordinator | None = None
+
+        self.customer_id = dataset.get(CONF_CUSTOMER_ID)
+        self.name = f"{CONF_DEVICE_NAME}: {self.customer_id}"
         self._username = dataset.get(CONF_USERNAME)
         self._password = dataset.get(CONF_PASSWORD)
-        self._area_name = dataset.get(CONF_AREA)
-        self._customer_id = dataset.get(CONF_CUSTOMER_ID)
+        self._area = dataset.get(CONF_AREA)
         self._monthly_start = dataset.get(CONF_MONTHLY_START)
-        self._api = api
-        self._data = {}
-        self._branches_data = None  # Will store the branch data
 
-    async def async_load_branches(self):
-        """Load EVN branches data asynchronously"""
-        try:
-            file_path = os.path.join(os.path.dirname(evn_core.__file__), "evn_branches.json")
-            self._branches_data = await self.hass.async_add_executor_job(
-                evn_core.read_evn_branches_file, file_path
-            )
-        except Exception as ex:
-            _LOGGER.error("Error loading branches data: %s", str(ex))
+        self.data: dict[str, Any] = {}
+        self.device_info: DeviceInfo | None = None
+
+    async def _async_build_device_info(self) -> None:
+        """Tính DeviceInfo một lần (tra chi nhánh trong evn_branches.json)."""
+        branches = await evn_core.async_load_evn_branches(self.hass)
+        hw_version = f"by {self._area['name']}"
+
+        if branches:
+            evn_info = evn_core.get_evn_info_sync(self.customer_id, branches)
+            if (
+                evn_info["status"] == CONF_SUCCESS
+                and evn_info["evn_branch"] != "Unknown"
+            ):
+                hw_version = f"by {evn_info['evn_branch']}"
+
+        self.device_info = DeviceInfo(
+            name=self.name,
+            identifiers={(DOMAIN, self.customer_id)},
+            manufacturer=CONF_DEVICE_MANUFACTURER,
+            sw_version=CONF_DEVICE_SW_VERSION,
+            hw_version=hw_version,
+            model=CONF_DEVICE_MODEL,
+        )
+
+    async def _async_request(self) -> dict[str, Any]:
+        return await self._api.request_update(
+            self._area,
+            self._username,
+            self._password,
+            self.customer_id,
+            self._monthly_start,
+        )
 
     async def update(self) -> dict[str, Any]:
         """Update device data from EVN Endpoints."""
 
-        self._data = await self._api.request_update(
-            self._area_name, self._username, self._password, self._customer_id, self._monthly_start
-        )
+        self.data = await self._async_request()
 
-        status = self._data.get("status")
-
-        if status != CONF_SUCCESS:
-
-            if status == CONF_ERR_INVALID_AUTH:
-                _LOGGER.info(
-                    "[EVN ID %s] Expired session, try reauthenticating.",
-                    self._customer_id,
-                )
-
-                login_state = await self._api.login(
-                    self._area_name,
-                    self._username,
-                    self._password,
-                    self._customer_id,
-                )
-
-                if login_state == CONF_SUCCESS:
-                    self._data = await self._api.request_update(
-                        self._area_name,
-                        self._username,
-                        self._password,
-                        self._customer_id,
-                        self._monthly_start,
-                    )
-                    status = self._data.get("status")
-
-        if status == CONF_SUCCESS:
+        if self.data.get("status") == CONF_ERR_INVALID_AUTH:
             _LOGGER.info(
-                "[EVN ID %s] Successfully fetched new data from EVN Server.",
-                self._customer_id,
+                "[EVN ID %s] Expired session, try reauthenticating.",
+                self.customer_id,
             )
 
+            login_state = await self._api.login(
+                self._area, self._username, self._password, self.customer_id
+            )
+
+            if login_state == CONF_SUCCESS:
+                self.data = await self._async_request()
+
+        if self.data.get("status") == CONF_SUCCESS:
+            _LOGGER.debug(
+                "[EVN ID %s] Successfully fetched new data from EVN Server.",
+                self.customer_id,
+            )
         else:
             _LOGGER.warning(
                 "[EVN ID %s] Could not fetch new data - %s",
-                self._customer_id,
-                self._data.get("data"),
+                self.customer_id,
+                self.data.get("data"),
             )
 
-        return self._data
-
-    async def _async_update(self):
-        """Fetch the latest data from EVN."""
-        await self.update()
+        return self.data
 
     async def async_create_coordinator(
         self, hass: HomeAssistant, entry: ConfigEntry
@@ -167,82 +167,54 @@ class EVNDevice:
         if self._coordinator:
             return
 
-        await self.async_load_branches()
+        await self._async_build_device_info()
 
         coordinator = DataUpdateCoordinator(
             hass,
             _LOGGER,
             config_entry=entry,
-            name=f"{DOMAIN}-{self._customer_id}",
-            update_method=self._async_update,
+            name=f"{DOMAIN}-{self.customer_id}",
+            update_method=self.update,
             update_interval=DEFAULT_SCAN_INTERVAL,
         )
         await coordinator.async_config_entry_first_refresh()
         self._coordinator = coordinator
 
     @property
-    def info(self) -> DeviceInfo:
-        """Return device description for device registry."""
-        evn_area = evn_core.get_evn_info_sync(self._customer_id, self._branches_data)
-        hw_version = f"by {self._area_name['name']}"
-
-        if (evn_area["status"] == CONF_SUCCESS) and (
-            evn_area["evn_branch"] != "Unknown"
-        ):
-            hw_version = f"by {evn_area['evn_branch']}"
-
-        return DeviceInfo(
-            name=self._name,
-            identifiers={(DOMAIN, self._customer_id)},
-            manufacturer=CONF_DEVICE_MANUFACTURER,
-            sw_version=CONF_DEVICE_SW_VERSION,
-            hw_version=hw_version,
-            model=CONF_DEVICE_MODEL,
-        )
-
-    @property
-    def coordinator(self) -> DataUpdateCoordinator or None:
+    def coordinator(self) -> DataUpdateCoordinator | None:
         """Return coordinator associated."""
         return self._coordinator
-
-    @property
-    def branch_info(self):
-        """Get branch info synchronously."""
-        if self._branches_data is None:
-            return {"status": CONF_ERR_UNKNOWN}
-        return evn_core.get_evn_info_sync(self._customer_id, self._branches_data)
 
 
 class EVNSensor(CoordinatorEntity, SensorEntity):
     """EVN Sensor Instance."""
 
-    def __init__(
-        self, device: EVNDevice, description: EVNSensorEntityDescription, hass
-    ):
+    entity_description: EVNSensorEntityDescription
+
+    def __init__(self, device: EVNDevice, description: EVNSensorEntityDescription):
         """Construct EVN sensor wrapper."""
         super().__init__(device.coordinator)
 
         self._device = device
-        self._attr_name = f"{device._name} {description.name}"
-        self._unique_id = str(f"{device._customer_id}_{description.key}").lower()
         self._default_name = description.name
-
-        self.entity_id = (
-            f"{ENTITY_DOMAIN}.{device._customer_id}_{description.key}".lower()
-        )
         self.entity_description = description
 
-    @property
-    def unique_id(self) -> str:
-        """Return a unique ID."""
-        return self._unique_id
+        self._attr_name = f"{device.name} {description.name}"
+        self._attr_unique_id = f"{device.customer_id}_{description.key}".lower()
+        self._attr_device_info = device.device_info
+        self.entity_id = f"{ENTITY_DOMAIN}.{self._attr_unique_id}"
+
+    def _current(self) -> dict | None:
+        """Dữ liệu {"value", "info"} hiện tại của sensor này."""
+        data = self.entity_description.value_fn(self._device.data)
+        return data if isinstance(data, dict) else None
 
     @property
     def native_value(self):
         """Return the state of the sensor."""
-        data = self.entity_description.value_fn(self._device._data)
+        data = self._current()
 
-        if not isinstance(data, dict):
+        if data is None:
             return None
 
         if self.entity_description.dynamic_name:
@@ -254,38 +226,17 @@ class EVNSensor(CoordinatorEntity, SensorEntity):
         return data.get("value")
 
     @property
-    def device_info(self):
-        """Return a device description for device registry."""
-        hw_version = f"by {self._device._area_name['name']}"
-
-        evn_area = self._device.branch_info
-        if (evn_area["status"] == CONF_SUCCESS) and (
-            evn_area["evn_branch"] != "Unknown"
-        ):
-            hw_version = f"by {evn_area['evn_branch']}"
-
-        return DeviceInfo(
-            name=self._device._name,
-            identifiers={(DOMAIN, self._device._customer_id)},
-            manufacturer=CONF_DEVICE_MANUFACTURER,
-            sw_version=CONF_DEVICE_SW_VERSION,
-            hw_version=hw_version,
-            model=CONF_DEVICE_MODEL,
-        )
-
-    @property
     def available(self) -> bool:
         """Return the availability of the sensor."""
-        return (
-            self._device._data.get("status") == CONF_SUCCESS
-            and self.native_value is not None
-        )
+        if self._device.data.get("status") != CONF_SUCCESS:
+            return False
+        data = self._current()
+        return data is not None and data.get("value") is not None
 
     @property
     def last_reset(self):
         if self.entity_description.state_class == SensorStateClass.TOTAL:
-            data = self.entity_description.value_fn(self._device._data)
-
-            return data.get("info") if isinstance(data, dict) else None
+            data = self._current()
+            return data.get("info") if data else None
 
         return None
