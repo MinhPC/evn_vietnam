@@ -128,16 +128,15 @@ Các sensor **Sản lượng / Tiền điện** theo ngày có tên hiển thị
 
 ## Cách tính tiền điện
 
-Các sensor tiền điện được **tính thủ công** từ sản lượng theo **biểu giá bán lẻ điện sinh hoạt** (6 bậc) cộng **VAT 8%**:
+Các sensor tiền điện được **tính thủ công** từ sản lượng theo **biểu giá bán lẻ điện sinh hoạt** (5 bậc) cộng **VAT 8%**:
 
 | Bậc | Mức tiêu thụ | Đơn giá (đ/kWh) |
 |:---:|:---|:---:|
-| 1 | 0 – 50 kWh | 1.984 |
-| 2 | 51 – 100 kWh | 2.050 |
-| 3 | 101 – 200 kWh | 2.380 |
-| 4 | 201 – 300 kWh | 2.998 |
-| 5 | 301 – 400 kWh | 3.350 |
-| 6 | > 400 kWh | 3.460 |
+| 1 | 0 – 100 kWh | 1.901 |
+| 2 | 101 – 200 kWh | 2.289 |
+| 3 | 201 – 400 kWh | 2.894 |
+| 4 | 401 – 700 kWh | 3.456 |
+| 5 | > 700 kWh | 3.844 |
 
 > ⚠️ Đây chỉ là **con số tham khảo**, không lấy trực tiếp từ EVN. Sản lượng ngày lẻ được áp giá bậc thang nên **sai số có thể lớn**. Biểu giá được khai báo trong [`const.py`](custom_components/evn_vietnam/const.py) (`VIETNAM_ECOST_STAGES`, `VIETNAM_ECOST_VAT`) — bạn có thể chỉnh khi EVN cập nhật giá. Xem biểu giá chính thức tại [evn.com.vn](https://www.evn.com.vn/c3/evn-va-khach-hang/Bieu-gia-ban-le-dien-9-79.aspx).
 

@@ -52,7 +52,7 @@ Mỗi tổng công ty có endpoint, header, payload và cấu trúc JSON **khác
 - **Status codes** là string trong `const.py` (`CONF_SUCCESS = "success"`, `CONF_ERR_*`), không phải enum. Hàm trả `(status, data)` hoặc dict có key `"status"`.
 - **Tiền điện** tính thủ công trong `calc_ecost()` theo biểu giá bậc thang `VIETNAM_ECOST_STAGES` + `VIETNAM_ECOST_VAT` (const.py). Cập nhật giá = sửa 2 hằng này.
 - **Dynamic name/icon**: sensor có `dynamic_name=True` đổi tên hiển thị theo `info` (hôm nay/hôm qua/ngày dd/mm); `dynamic_icon=True` đổi icon theo trạng thái.
-- **Đổi version**: sửa ĐỒNG THỜI `manifest.json` (`"version"`) và `const.py` (`CONF_DEVICE_SW_VERSION`). Hiện tại: **1.0.0**.
+- **Đổi version**: sửa ĐỒNG THỜI `manifest.json` (`"version"`) và `const.py` (`CONF_DEVICE_SW_VERSION`). Hiện tại: **1.0.2**.
 - Text hiển thị chủ yếu bằng **tiếng Việt** — giữ nguyên phong cách khi thêm string; đồng bộ cả `translations/en.json` và `vi.json`.
 
 ## Kiểm tra trước khi commit
