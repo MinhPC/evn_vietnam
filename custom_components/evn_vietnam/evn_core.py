@@ -15,7 +15,6 @@ from typing import Any
 from dateutil import parser
 
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import (
     async_create_clientsession,
     async_get_clientsession,
@@ -50,6 +49,7 @@ from .const import (
     ID_OUTAGE_START,
     ID_OUTAGE_WINDOWS,
     ID_TO_DATE,
+    ID_UNPAID_COUNT,
     STATUS_N_PAYMENT_NEEDED,
     STATUS_PAYMENT_NEEDED,
     STATUS_LOADSHEDDING,
@@ -418,7 +418,8 @@ class EVNAPI:
         if self.is_token_expired():
             login_status = await self.login_evnhanoi(username, password)
             if login_status != CONF_SUCCESS:
-                raise ConfigEntryNotReady("Token expired and failed to reauthenticate")
+                # Trả status để EVNDevice.update() quyết định reauth/thử lại
+                return {"status": login_status, "data": "Token expired"}
 
         headers = {
             "Authorization": f"Bearer {self._evn_area.get('access_token')}",
@@ -505,9 +506,11 @@ class EVNAPI:
 
         payment_status = CONF_ERR_UNKNOWN
         m_payment_status = 0
+        unpaid_count = None
 
         if status == CONF_SUCCESS and not resp_json["isError"]:
             debts = resp_json["data"]["listThongTinNoKhachHangVm"]
+            unpaid_count = len(debts)
             if debts:
                 payment_status = STATUS_PAYMENT_NEEDED
                 m_payment_status = int(debts[0]["tongTien"].replace(".", ""))
@@ -515,7 +518,11 @@ class EVNAPI:
                 payment_status = STATUS_N_PAYMENT_NEEDED
 
         fetched_data.update(
-            {ID_PAYMENT_NEEDED: payment_status, ID_M_PAYMENT_NEEDED: m_payment_status}
+            {
+                ID_PAYMENT_NEEDED: payment_status,
+                ID_M_PAYMENT_NEEDED: m_payment_status,
+                ID_UNPAID_COUNT: unpaid_count,
+            }
         )
 
         return fetched_data
@@ -531,8 +538,9 @@ class EVNAPI:
 
         if not isinstance(expires, datetime) or datetime.now(tz=timezone.utc) >= expires:
             _LOGGER.debug("EVNHCMC session missing/expired, logging in again")
-            if await self.login_evnhcmc(username, password) != CONF_SUCCESS:
-                raise ConfigEntryNotReady("Session expired and failed to reauthenticate")
+            login_status = await self.login_evnhcmc(username, password)
+            if login_status != CONF_SUCCESS:
+                return {"status": login_status, "data": "Session expired"}
 
         headers = {
             "User-Agent": UA_BROWSER,
@@ -618,7 +626,12 @@ class EVNAPI:
                 payment_status = STATUS_N_PAYMENT_NEEDED
 
         fetched_data.update(
-            {ID_PAYMENT_NEEDED: payment_status, ID_M_PAYMENT_NEEDED: m_payment_status}
+            {
+                ID_PAYMENT_NEEDED: payment_status,
+                ID_M_PAYMENT_NEEDED: m_payment_status,
+                # API chỉ trả một khoản nợ tổng hợp
+                ID_UNPAID_COUNT: _count_from_status(payment_status),
+            }
         )
 
         return fetched_data
@@ -699,9 +712,12 @@ class EVNAPI:
 
         payment_status = CONF_ERR_UNKNOWN
         m_payment_status = 0
+        unpaid_count = None
 
         if status == CONF_SUCCESS and "data" in resp_json:
             invoices = (resp_json["data"].get("customerInfo") or {}).get("invoice")
+            if isinstance(invoices, list):
+                unpaid_count = sum(1 for inv in invoices if not inv.get("paid"))
 
             if invoices:
                 if invoices[0].get("paid"):
@@ -714,6 +730,7 @@ class EVNAPI:
             {
                 ID_PAYMENT_NEEDED: payment_status,
                 ID_M_PAYMENT_NEEDED: m_payment_status,
+                ID_UNPAID_COUNT: unpaid_count,
             }
         )
 
@@ -790,6 +807,8 @@ class EVNAPI:
             {
                 ID_PAYMENT_NEEDED: payment_status,
                 ID_M_PAYMENT_NEEDED: m_payment_status,
+                # API chỉ trả hóa đơn gần nhất
+                ID_UNPAID_COUNT: _count_from_status(payment_status),
                 ID_ECON_TOTAL_NEW: round(_vn_num(current_einfo.get("chiSo")), 2),
                 ID_ECON_TOTAL_OLD: round(_vn_num(info.get("chiSoCuoiKy")), 2),
                 "to_date": to_date,
@@ -873,11 +892,15 @@ class EVNAPI:
         if status == CONF_SUCCESS and isinstance(resp_json, list) and resp_json:
             fetched_data[ID_PAYMENT_NEEDED] = STATUS_PAYMENT_NEEDED
             fetched_data[ID_M_PAYMENT_NEEDED] = int(resp_json[0].get("lTongTien", 0))
+            fetched_data[ID_UNPAID_COUNT] = len(resp_json)
         else:
             fetched_data[ID_PAYMENT_NEEDED] = (
                 STATUS_N_PAYMENT_NEEDED if status == CONF_EMPTY else CONF_ERR_UNKNOWN
             )
             fetched_data[ID_M_PAYMENT_NEEDED] = 0
+            fetched_data[ID_UNPAID_COUNT] = (
+                0 if status == CONF_EMPTY else None
+            )
 
         status, resp_json = await fetch_with_retries(
             url=self._evn_area.get("evn_loadshedding_url"),
@@ -1052,12 +1075,25 @@ def formatted_result(raw_data: dict) -> dict:
             "value": round((end - start).total_seconds() / 3600, 1)
         }
 
+    unpaid_count = raw_data.get(ID_UNPAID_COUNT)
+    if unpaid_count is not None:
+        res[ID_UNPAID_COUNT] = {"value": unpaid_count}
+
     from_date = raw_data.get(ID_FROM_DATE) or time_obj.replace(day=1)
     res[ID_FROM_DATE] = {"value": from_date.strftime("%d/%m/%Y")}
     res[ID_TO_DATE] = {"value": raw_data["to_date"].strftime("%d/%m/%Y")}
     res[ID_LATEST_UPDATE] = {"value": time_obj.astimezone()}
 
     return res
+
+
+def _count_from_status(payment_status):
+    """Số khoản nợ suy từ trạng thái (khi API không trả danh sách)."""
+    if payment_status == STATUS_PAYMENT_NEEDED:
+        return 1
+    if payment_status == STATUS_N_PAYMENT_NEEDED:
+        return 0
+    return None
 
 
 _PAYMENT_ICONS = {

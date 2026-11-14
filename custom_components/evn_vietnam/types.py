@@ -13,6 +13,7 @@ from .const import (
     ID_OUTAGE_DURATION,
     ID_OUTAGE_END,
     ID_OUTAGE_START,
+    ID_UNPAID_COUNT,
     ID_ECON_DAILY_NEW,
     ID_ECON_DAILY_OLD,
     ID_ECON_MONTHLY_NEW,
@@ -235,6 +236,12 @@ EVN_SENSORS: tuple[EVNSensorEntityDescription, ...] = (
         native_unit_of_measurement="VNĐ",
         value_fn=lambda data: data.get(ID_M_PAYMENT_NEEDED),
         dynamic_icon=True,
+    ),
+    EVNSensorEntityDescription(
+        key=ID_UNPAID_COUNT,
+        name="Số hóa đơn chưa thanh toán",
+        icon="mdi:file-document-alert-outline",
+        value_fn=lambda data: data.get(ID_UNPAID_COUNT),
     ),
     EVNSensorEntityDescription(
         key=ID_LOADSHEDDING,
