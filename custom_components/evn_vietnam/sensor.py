@@ -1,5 +1,6 @@
 """Setup and manage HomeAssistant Entities."""
 
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -10,6 +11,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -29,13 +31,14 @@ from .const import (
     CONF_ERR_INVALID_AUTH,
     CONF_MONTHLY_START,
     CONF_PASSWORD,
+    CONF_SCAN_INTERVAL_MINUTES,
     CONF_SUCCESS,
     CONF_USERNAME,
     DEFAULT_SCAN_INTERVAL,
+    DATA_DEVICE,
     DOMAIN,
-    ID_LOADSHEDDING,
 )
-from .types import EVN_SENSORS, EVNSensorEntityDescription
+from .types import EVN_SENSORS, LOADSHEDDING_SENSOR_KEYS, EVNSensorEntityDescription
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,20 +49,16 @@ async def async_setup_entry(
     """Setup the sensor platform."""
 
     entry_config = hass.data[DOMAIN][entry.entry_id]
+    evn_device: EVNDevice = entry_config[DATA_DEVICE]
 
-    evn_api = evn_core.EVNAPI(hass, True)
-    evn_device = EVNDevice(entry_config, evn_api)
-
-    await evn_device.async_create_coordinator(hass, entry)
-
-    # Chỉ khu vực có API lịch cắt điện (hiện tại: EVNSPC) mới tạo sensor này
+    # Chỉ khu vực có API lịch cắt điện (hiện tại: EVNSPC) mới tạo các sensor này
     evn_area = entry_config.get(CONF_AREA) or {}
     supports_loadshedding = bool(evn_area.get("evn_loadshedding_url"))
 
     descriptions = [
         description
         for description in EVN_SENSORS
-        if description.key != ID_LOADSHEDDING or supports_loadshedding
+        if description.key not in LOADSHEDDING_SENSOR_KEYS or supports_loadshedding
     ]
 
     # Dọn entity cũ không còn được tạo (vd loadshedding ở khu vực không hỗ trợ)
@@ -70,7 +69,10 @@ async def async_setup_entry(
     }
     registry = er.async_get(hass)
     for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
-        if reg_entry.unique_id not in created_unique_ids:
+        if (
+            reg_entry.domain == ENTITY_DOMAIN
+            and reg_entry.unique_id not in created_unique_ids
+        ):
             registry.async_remove(reg_entry.entity_id)
 
     async_add_entities(
@@ -145,6 +147,11 @@ class EVNDevice:
 
             if login_state == CONF_SUCCESS:
                 self.data = await self._async_request()
+            elif login_state == CONF_ERR_INVALID_AUTH:
+                # Sai tài khoản/mật khẩu (vd đã đổi mật khẩu) -> yêu cầu nhập lại
+                raise ConfigEntryAuthFailed(
+                    f"Đăng nhập EVN thất bại cho mã KH {self.customer_id}"
+                )
 
         if self.data.get("status") == CONF_SUCCESS:
             _LOGGER.debug(
@@ -169,13 +176,16 @@ class EVNDevice:
 
         await self._async_build_device_info()
 
+        minutes = entry.options.get(CONF_SCAN_INTERVAL_MINUTES)
+        interval = timedelta(minutes=minutes) if minutes else DEFAULT_SCAN_INTERVAL
+
         coordinator = DataUpdateCoordinator(
             hass,
             _LOGGER,
             config_entry=entry,
             name=f"{DOMAIN}-{self.customer_id}",
             update_method=self.update,
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            update_interval=interval,
         )
         await coordinator.async_config_entry_first_refresh()
         self._coordinator = coordinator

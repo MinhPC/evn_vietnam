@@ -3,13 +3,16 @@
 from datetime import timedelta
 
 DEFAULT_SCAN_INTERVAL = timedelta(hours=3)
+CONF_SCAN_INTERVAL_MINUTES = "scan_interval_minutes"  # trong entry.options
+MIN_SCAN_INTERVAL_MINUTES = 60
+MAX_SCAN_INTERVAL_MINUTES = 1440
 
 DOMAIN = "evn_vietnam"
 
 CONF_DEVICE_NAME = "EVN Monitor"
 CONF_DEVICE_MODEL = "Vietnam EVN Monitor"
 CONF_DEVICE_MANUFACTURER = "Minh Phan"
-CONF_DEVICE_SW_VERSION = "1.0.2"
+CONF_DEVICE_SW_VERSION = "1.1.0"
 
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
@@ -38,6 +41,17 @@ ID_ECOST_MONTHLY_NEW = "ecost_monthly_new"
 ID_PAYMENT_NEEDED = "payment_needed"
 ID_M_PAYMENT_NEEDED = "m_payment_needed"
 ID_LOADSHEDDING = "loadshedding"
+DATA_DEVICE = "device"  # key trong hass.data[DOMAIN][entry_id]
+ID_LOADSHEDDING_LIST = "loadshedding_list"  # list chuỗi thô (dữ liệu trung gian)
+ID_OUTAGE_WINDOWS = "outage_windows"  # list (start, end) aware datetime (không phải sensor)
+ID_OUTAGE_START = "outage_start"
+ID_OUTAGE_END = "outage_end"
+ID_OUTAGE_DURATION = "outage_duration"
+ID_OUTAGE_COUNT = "outage_count"
+ID_OUTAGE_SOON = "outage_soon"
+ID_OUTAGE_ACTIVE = "outage_active"
+ID_REFRESH = "refresh"
+OUTAGE_SOON_WINDOW_HOURS = 24
 ID_FROM_DATE = "from_date"
 ID_TO_DATE = "to_date"
 ID_LATEST_UPDATE = "latest_update"

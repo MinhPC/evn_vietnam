@@ -6,9 +6,13 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import UnitOfEnergy, UnitOfTime
 
 from .const import (
+    ID_OUTAGE_COUNT,
+    ID_OUTAGE_DURATION,
+    ID_OUTAGE_END,
+    ID_OUTAGE_START,
     ID_ECON_DAILY_NEW,
     ID_ECON_DAILY_OLD,
     ID_ECON_MONTHLY_NEW,
@@ -239,4 +243,43 @@ EVN_SENSORS: tuple[EVNSensorEntityDescription, ...] = (
         value_fn=lambda data: data.get(ID_LOADSHEDDING),
         dynamic_icon=True,
     ),
+    EVNSensorEntityDescription(
+        key=ID_OUTAGE_START,
+        name="Cắt điện tiếp theo",
+        icon="mdi:transmission-tower-off",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda data: data.get(ID_OUTAGE_START),
+    ),
+    EVNSensorEntityDescription(
+        key=ID_OUTAGE_END,
+        name="Cấp điện lại dự kiến",
+        icon="mdi:transmission-tower-import",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda data: data.get(ID_OUTAGE_END),
+    ),
+    EVNSensorEntityDescription(
+        key=ID_OUTAGE_DURATION,
+        name="Thời gian cắt điện",
+        icon="mdi:timer-outline",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.HOURS,
+        value_fn=lambda data: data.get(ID_OUTAGE_DURATION),
+    ),
+    EVNSensorEntityDescription(
+        key=ID_OUTAGE_COUNT,
+        name="Số lịch cắt điện",
+        icon="mdi:counter",
+        value_fn=lambda data: data.get(ID_OUTAGE_COUNT),
+    ),
+)
+
+# Sensor chỉ tạo ở khu vực có API lịch cắt điện
+LOADSHEDDING_SENSOR_KEYS = frozenset(
+    {
+        ID_LOADSHEDDING,
+        ID_OUTAGE_START,
+        ID_OUTAGE_END,
+        ID_OUTAGE_DURATION,
+        ID_OUTAGE_COUNT,
+    }
 )

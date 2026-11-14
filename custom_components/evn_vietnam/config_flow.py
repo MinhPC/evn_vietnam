@@ -8,6 +8,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from . import evn_core
@@ -17,9 +18,13 @@ from .const import (
     CONF_ERR_UNKNOWN,
     CONF_MONTHLY_START,
     CONF_PASSWORD,
+    CONF_SCAN_INTERVAL_MINUTES,
     CONF_SUCCESS,
     CONF_USERNAME,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MAX_SCAN_INTERVAL_MINUTES,
+    MIN_SCAN_INTERVAL_MINUTES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +57,45 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the Config Flow for setting up this Integration."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return EVNOptionsFlow()
+
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
+        """Bắt đầu reauth khi đăng nhập EVN thất bại."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Nhập lại tài khoản/mật khẩu."""
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._user_data = {**entry.data, **user_input}
+            self._api = evn_core.EVNAPI(self.hass, True)
+            result = await self._try_auth()
+            if result == CONF_SUCCESS:
+                # Update listener của entry sẽ tự reload
+                self.hass.config_entries.async_update_entry(
+                    entry, data=self._user_data
+                )
+                return self.async_abort(reason="reauth_successful")
+            errors["base"] = result
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                AUTH_FIELD({CONF_USERNAME: entry.data.get(CONF_USERNAME)})
+            ),
+            errors=errors,
+            description_placeholders={
+                "customer_id": entry.data.get(CONF_CUSTOMER_ID, "")
+            },
+        )
 
     def __init__(self):
         self._user_data = {}
@@ -184,3 +228,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return CONF_ERR_UNKNOWN
 
         return res["status"]
+
+
+class EVNOptionsFlow(config_entries.OptionsFlow):
+    """Tuỳ chọn: chu kỳ cập nhật dữ liệu."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        default = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL_MINUTES,
+            int(DEFAULT_SCAN_INTERVAL.total_seconds() // 60),
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_SCAN_INTERVAL_MINUTES, default=default): vol.All(
+                        int,
+                        vol.Range(
+                            min=MIN_SCAN_INTERVAL_MINUTES,
+                            max=MAX_SCAN_INTERVAL_MINUTES,
+                        ),
+                    )
+                }
+            ),
+        )

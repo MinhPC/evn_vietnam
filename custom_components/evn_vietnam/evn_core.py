@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
+import re
 import ssl
 import time
 from typing import Any
@@ -42,6 +43,12 @@ from .const import (
     ID_M_PAYMENT_NEEDED,
     ID_PAYMENT_NEEDED,
     ID_LOADSHEDDING,
+    ID_LOADSHEDDING_LIST,
+    ID_OUTAGE_COUNT,
+    ID_OUTAGE_DURATION,
+    ID_OUTAGE_END,
+    ID_OUTAGE_START,
+    ID_OUTAGE_WINDOWS,
     ID_TO_DATE,
     STATUS_N_PAYMENT_NEEDED,
     STATUS_PAYMENT_NEEDED,
@@ -884,6 +891,11 @@ class EVNAPI:
 
         if status == CONF_SUCCESS and isinstance(resp_json, list) and resp_json:
             fetched_data[ID_LOADSHEDDING] = resp_json[0].get("strThoiGianMatDien")
+            fetched_data[ID_LOADSHEDDING_LIST] = [
+                item.get("strThoiGianMatDien")
+                for item in resp_json
+                if isinstance(item, dict) and item.get("strThoiGianMatDien")
+            ]
         else:
             fetched_data[ID_LOADSHEDDING] = (
                 STATUS_LOADSHEDDING if status == CONF_EMPTY else CONF_ERR_UNKNOWN
@@ -1023,6 +1035,23 @@ def formatted_result(raw_data: dict) -> dict:
         "info": "mdi:transmission-tower-off",
     }
 
+    # Các khung giờ cắt điện chưa kết thúc, sắp theo giờ bắt đầu
+    now_vn = datetime.now(_VN_TZ)
+    windows = sorted(
+        w
+        for w in parse_outage_windows(raw_data.get(ID_LOADSHEDDING_LIST) or [])
+        if w[1] > now_vn
+    )
+    res[ID_OUTAGE_WINDOWS] = windows
+    res[ID_OUTAGE_COUNT] = {"value": len(windows)}
+    if windows:
+        start, end = windows[0]
+        res[ID_OUTAGE_START] = {"value": start}
+        res[ID_OUTAGE_END] = {"value": end}
+        res[ID_OUTAGE_DURATION] = {
+            "value": round((end - start).total_seconds() / 3600, 1)
+        }
+
     from_date = raw_data.get(ID_FROM_DATE) or time_obj.replace(day=1)
     res[ID_FROM_DATE] = {"value": from_date.strftime("%d/%m/%Y")}
     res[ID_TO_DATE] = {"value": raw_data["to_date"].strftime("%d/%m/%Y")}
@@ -1131,6 +1160,35 @@ def format_loadshedding(raw_value: str) -> str:
 
     except Exception:
         return STATUS_LOADSHEDDING
+
+
+_VN_TZ = timezone(timedelta(hours=7))
+_OUTAGE_TIME_RE = re.compile(
+    r"(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:ngày\s*)?(\d{1,2}/\d{1,2}/\d{4})"
+)
+
+
+def parse_outage_windows(raw_values) -> list[tuple[datetime, datetime]]:
+    """Parse "từ HH:MM:SS ngày dd/mm/yyyy đến HH:MM:SS ngày dd/mm/yyyy"
+    -> [(start, end)] (aware datetime, giờ Việt Nam). Bỏ qua chuỗi sai định dạng."""
+    windows = []
+    for raw in raw_values:
+        matches = _OUTAGE_TIME_RE.findall(raw or "")
+        if len(matches) != 2:
+            continue
+        try:
+            start, end = (
+                datetime.strptime(
+                    f"{d} {t if t.count(':') == 2 else t + ':00'}",
+                    "%d/%m/%Y %H:%M:%S",
+                ).replace(tzinfo=_VN_TZ)
+                for t, d in matches
+            )
+        except ValueError:
+            continue
+        if end > start:
+            windows.append((start, end))
+    return windows
 
 
 def strip_date_range(date_str):

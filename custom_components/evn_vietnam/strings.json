@@ -3,7 +3,8 @@
         "abort": {
             "already_configured": "A device with your Customer ID has already been configured.",
             "not_supported": "Based on your Customer ID: **{customer_id}**\nAutomatically detect your EVN location:\n- EVN Company: **{evn_name}**\n- EVN Location: **{evn_location}**\n- EVN Branch: **{evn_branch}**\n\nUnfortunately, your EVN location has not been supported yet.\nPlease contact **github@MinhPC**, together we could make it happen.",
-            "unknown": "Invalid EVN Customer ID: **{customer_id}**"
+            "unknown": "Invalid EVN Customer ID: **{customer_id}**",
+            "reauth_successful": "Re-authentication was successful."
         },
         "error": {
             "cannot_connect": "Failed to connect to EVN Server.",
@@ -31,6 +32,25 @@
                     "monthly_start": "Billing Start Date"
                 },
                 "description": "Fulfill your EVN informations for the following ID:\n\n- Customer ID: **{customer_id}**\n- EVN Branch: **{evn_name}**\n\n`Note: Date Start is the date your monthly electric bill starts`"
+            },
+            "reauth_confirm": {
+                "title": "Re-authenticate EVN",
+                "description": "The EVN login for customer **{customer_id}** is no longer valid. Please enter your credentials again.",
+                "data": {
+                    "username": "Username",
+                    "password": "Password"
+                }
+            }
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Options",
+                "description": "Data refresh interval from EVN (60-1440 minutes). Very low values may get you blocked.",
+                "data": {
+                    "scan_interval_minutes": "Update interval (minutes)"
+                }
             }
         }
     }
